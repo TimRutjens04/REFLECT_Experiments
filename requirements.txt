@@ -1,0 +1,11 @@
+torch
+torchvision
+transformers
+open_clip_torch
+Pillow
+scikit-learn
+numpy
+pandas
+tqdm
+python-dotenv
+matplotlib

@@ -1,0 +1,7 @@
+pair,n_test,adapter_ap,adapter_acc
+full_empty,32,0.9154077540106952,0.78125
+open_closed,32,0.8981664265322988,0.75
+on_off,32,0.7216680477592913,0.53125
+cooked_raw,9,0.5099206349206349,0.6666666666666666
+dirty_clean,24,1.0,1.0
+broken_intact,4,1.0,1.0

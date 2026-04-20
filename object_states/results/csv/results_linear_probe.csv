@@ -1,0 +1,3 @@
+model,zero_shot_ap_changeit,probe_ap_sim,probe_acc_sim
+SigLIP2,0.881,0.9543922940366913,0.9
+CLIP,0.844,0.8679155866708386,0.7833333333333333

@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.Python
+venv/
+.env
+
+# macOS
+.DS_Store
+
+# ChangeIt video frames (copyright, download separately)
+object_states/data/ChangeIT-Subset-Crop/
+
+# Logs
+*.log
+
+# Jupyter checkpoints
+.ipynb_checkpoints/
+
+# Claude
+/.claude
