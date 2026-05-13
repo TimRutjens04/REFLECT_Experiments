@@ -50,12 +50,13 @@ MODEL_PATH  = DATA / "adapter.pt"
 PAIR_NAMES = ["full_empty", "open_closed", "on_off", "cooked_raw", "dirty_clean", "broken_intact"]
 NUM_PAIRS  = len(PAIR_NAMES)
 
-BATCH_SIZE   = 32
-EPOCHS       = 10
-LR           = 1e-3
-WEIGHT_DECAY = 1e-4
-DROPOUT      = 0.1
-EMBED_DIM    = 1152
+BATCH_SIZE    = 32
+EPOCHS_SWEEP  = 20           # epochs per candidate during LR selection
+EPOCHS        = 30           # epochs for final training run
+LR_CANDIDATES = [1e-4, 3e-4, 1e-3]
+WEIGHT_DECAY  = 1e-3         # stronger regularisation for 723K params / ~500 samples
+DROPOUT       = 0.2          # increased from 0.1 for same reason
+EMBED_DIM     = 1152
 
 device = (
     "cuda" if torch.cuda.is_available()
@@ -113,6 +114,14 @@ X_train, y_train, p_train = embeddings[idx_train], labels[idx_train], pair_idxs[
 X_test,  y_test,  p_test  = embeddings[idx_test],  labels[idx_test],  pair_idxs[idx_test]
 print(f"\nTrain: {len(idx_train)}  Test: {len(idx_test)}")
 
+# Carve 10% of train for LR selection — stratified, never touches the test set
+idx_sub, idx_val_sel = train_test_split(
+    np.arange(len(idx_train)), test_size=0.1, random_state=42,
+    stratify=p_train * 2 + y_train)
+X_sub,     y_sub,     p_sub     = X_train[idx_sub],     y_train[idx_sub],     p_train[idx_sub]
+X_val_sel, y_val_sel, p_val_sel = X_train[idx_val_sel], y_train[idx_val_sel], p_train[idx_val_sel]
+print(f"LR selection split — sub-train: {len(idx_sub)}  val: {len(idx_val_sel)}")
+
 # ── Dataset ───────────────────────────────────────────────────────────────────
 class StateDataset(Dataset):
     def __init__(self, embeddings, labels, pair_idxs):
@@ -123,10 +132,8 @@ class StateDataset(Dataset):
     def __len__(self): return len(self.X)
     def __getitem__(self, i): return self.X[i], self.y[i], self.p[i]
 
-train_loader = DataLoader(StateDataset(X_train, y_train, p_train),
-                          batch_size=BATCH_SIZE, shuffle=True, drop_last=False)
-test_loader  = DataLoader(StateDataset(X_test,  y_test,  p_test),
-                          batch_size=BATCH_SIZE, shuffle=False)
+test_loader = DataLoader(StateDataset(X_test, y_test, p_test),
+                         batch_size=BATCH_SIZE, shuffle=False)
 
 # ── Model ─────────────────────────────────────────────────────────────────────
 class StateAdapter(nn.Module):
@@ -141,18 +148,14 @@ class StateAdapter(nn.Module):
     def forward(self, x):
         return self.net(x)   # [B, num_pairs]
 
-model = StateAdapter().to(device)
-n_params = sum(p.numel() for p in model.parameters())
+_tmp = StateAdapter()
+n_params = sum(p.numel() for p in _tmp.parameters())
 print(f"Adapter parameters: {n_params:,}  (~{n_params/1e6:.2f}M)")
+del _tmp
 
-# ── Training ──────────────────────────────────────────────────────────────────
-optimizer = AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
-scheduler = CosineAnnealingLR(optimizer, T_max=EPOCHS)
-
+# ── Loss ──────────────────────────────────────────────────────────────────────
 def masked_bce_loss(logits, labels, pair_idxs):
-    """BCEWithLogitsLoss only on the head for each sample's own state pair."""
     B = logits.shape[0]
-    # Build full target tensor: -1 for non-applicable pairs
     target = torch.full((B, NUM_PAIRS), -1.0, device=logits.device)
     for i in range(B):
         target[i, pair_idxs[i]] = labels[i]
@@ -160,21 +163,56 @@ def masked_bce_loss(logits, labels, pair_idxs):
     loss = F.binary_cross_entropy_with_logits(logits, target.clamp(0, 1), reduction="none")
     return (loss * mask).sum() / mask.sum().clamp(min=1)
 
-print(f"\nTraining for {EPOCHS} epochs...")
-for epoch in range(1, EPOCHS + 1):
-    model.train()
-    total_loss = 0.0
-    for x, y, p in train_loader:
-        x, y, p = x.to(device), y.to(device), p.to(device)
-        optimizer.zero_grad()
-        logits = model(x)
-        loss   = masked_bce_loss(logits, y, p)
-        loss.backward()
-        optimizer.step()
-        total_loss += loss.item() * len(x)
-    scheduler.step()
-    avg_loss = total_loss / len(idx_train)
-    print(f"  Epoch {epoch:>2}/{EPOCHS}  loss={avg_loss:.4f}")
+# ── Helpers ───────────────────────────────────────────────────────────────────
+def train_model(X_tr, y_tr, p_tr, epochs, lr, verbose=False):
+    m   = StateAdapter().to(device)
+    opt = AdamW(m.parameters(), lr=lr, weight_decay=WEIGHT_DECAY)
+    sch = CosineAnnealingLR(opt, T_max=epochs)
+    dl  = DataLoader(StateDataset(X_tr, y_tr, p_tr),
+                     batch_size=BATCH_SIZE, shuffle=True, drop_last=False)
+    for epoch in range(1, epochs + 1):
+        m.train()
+        total_loss = 0.0
+        for x, yb, pb in dl:
+            x, yb, pb = x.to(device), yb.to(device), pb.to(device)
+            opt.zero_grad()
+            loss = masked_bce_loss(m(x), yb, pb)
+            loss.backward()
+            opt.step()
+            total_loss += loss.item() * len(x)
+        sch.step()
+        if verbose:
+            print(f"  Epoch {epoch:>2}/{epochs}  loss={total_loss/len(X_tr):.4f}")
+    return m
+
+def eval_mean_ap(m, X, y, p):
+    m.eval()
+    with torch.no_grad():
+        logits = m(torch.from_numpy(X).float().to(device)).cpu().numpy()
+    aps = []
+    for i in range(NUM_PAIRS):
+        mask = p == i
+        if mask.sum() < 2 or len(np.unique(y[mask])) < 2:
+            continue
+        scores = torch.sigmoid(torch.from_numpy(logits[mask, i])).numpy()
+        aps.append(average_precision_score(y[mask], scores))
+    return float(np.mean(aps)) if aps else 0.0
+
+# ── LR selection ──────────────────────────────────────────────────────────────
+print(f"\nLR sweep ({EPOCHS_SWEEP} epochs each, selecting on val mean-AP)...")
+best_lr, best_val_ap = LR_CANDIDATES[0], -1.0
+for lr in LR_CANDIDATES:
+    m_cand = train_model(X_sub, y_sub, p_sub, EPOCHS_SWEEP, lr)
+    val_ap = eval_mean_ap(m_cand, X_val_sel, y_val_sel, p_val_sel)
+    marker = " ←" if val_ap > best_val_ap else ""
+    print(f"  lr={lr:.0e}  val mean-AP={val_ap:.3f}{marker}")
+    if val_ap > best_val_ap:
+        best_val_ap, best_lr = val_ap, lr
+print(f"Selected lr={best_lr:.0e}  (val mean-AP={best_val_ap:.3f})")
+
+# ── Final training on full train set ──────────────────────────────────────────
+print(f"\nFinal training: lr={best_lr:.0e}, {EPOCHS} epochs...")
+model = train_model(X_train, y_train, p_train, EPOCHS, best_lr, verbose=True)
 
 torch.save(model.state_dict(), MODEL_PATH)
 print(f"Saved → {MODEL_PATH}")
